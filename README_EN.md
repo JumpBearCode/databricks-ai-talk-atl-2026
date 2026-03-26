@@ -17,6 +17,7 @@
 9. [Key Takeaways from the Talk: Why Lakebase?](#9-key-takeaways-from-the-talk-why-lakebase)
 10. [Bidirectional Sync Between Lakehouse and Lakebase](#10-bidirectional-sync-between-lakehouse-and-lakebase)
 11. [CDC (Change Data Capture)](#11-cdc-change-data-capture)
+12. [Lakebase Branching: Git for Your Database](#12-lakebase-branching-git-for-your-database)
 
 ---
 
@@ -488,6 +489,177 @@ Every change is appended as a new row, preserving full history. The Lakehouse ca
 
 ---
 
+## 12. Lakebase Branching: Git for Your Database
+
+### Concept
+
+Lakebase Branching works like **Git for your database** — you can create a branch from any point in time on the entire database, with full data access, but **without copying a single byte**.
+
+```
+Production DB (100GB)
+    │
+    │  CREATE BRANCH (instant, additional storage ≈ 0)
+    │
+    ├── Branch: dev-testing
+    │     Modified 1GB of data → only 1GB of extra storage
+    │     Remaining 99GB shared with Production
+    │
+    └── Branch: schema-migration-test
+          Modified 500MB → only 500MB of extra storage
+```
+
+### Under the Hood: Copy-on-Write
+
+Lakebase's branching technology comes from **Neon**, acquired by Databricks — a project that re-architected PostgreSQL's storage engine.
+
+#### Traditional PostgreSQL vs Neon/Lakebase Architecture
+
+```
+Traditional PostgreSQL:
+  Compute + storage are coupled
+  Copying a database → must copy all data
+  100GB database → clone = 200GB total
+
+Neon/Lakebase Architecture:
+┌─────────────────────────┐
+│  Compute Layer           │  ← Standard PostgreSQL process
+└──────────┬──────────────┘
+           │  "Give me page #42 at LSN @100"
+┌──────────▼──────────────┐
+│  Pageserver              │  ← Core innovation
+│  • Never overwrites old  │
+│    pages, appends new    │
+│    versions              │
+│  • Rebuilds any version  │
+│    from WAL              │
+└──────────┬──────────────┘
+┌──────────▼──────────────┐
+│  Object Storage (S3)     │  ← All historical versions persisted
+└─────────────────────────┘
+```
+
+#### How Branch Creation Works
+
+```
+Step 1: User says "create branch at time T"
+Step 2: Pageserver records one piece of metadata:
+        "branch-dev starts at LSN of time T"
+Step 3: Done. Zero data copied.
+
+Read on branch:
+  → Request page #42
+  → Branch hasn't modified it → fetch from parent at time T's version
+
+Write on branch (Copy-on-Write):
+  → Modify page #42
+  → Pageserver creates a new version of page #42 for this branch only
+  → Production is completely unaffected
+```
+
+Visual representation:
+
+```
+                    Page #1   Page #2   Page #3   Page #4
+                    ─────────────────────────────────────
+Production (T=100):   [A]       [B]       [C]       [D]
+
+Branch modifies Page #2:
+
+Production:           [A]       [B]       [C]       [D]
+                       ↑         ↑         ↑         ↑
+Branch:                │       [B']        │         │
+                       │  (only this page  │         │
+                       │   is stored)      │         │
+                      shared  independent  shared   shared
+
+Extra storage = only the new version of Page #2
+```
+
+### Architectural Analogy with Delta Lake
+
+Lakebase Branching and Delta Lake version management are **fundamentally the same idea**:
+
+```
+Shared pattern:
+  1. Data is immutable once written (never overwrite)
+  2. A log/metadata layer records "which data blocks make up the current version"
+  3. Different versions/branches = different pointer combinations to the same underlying data
+```
+
+| | Delta Lake | Lakebase (Neon) |
+|--|-----------|-----------------|
+| Immutable data unit | Parquet file (tens of MB ~ 1GB) | Page (8KB) |
+| Version log | `_delta_log/` JSON transaction log | WAL (Write-Ahead Log) |
+| Version identifier | Version number (v0, v1, v2...) | LSN (Log Sequence Number) |
+| A version = | A set of file pointers | A set of page pointers |
+| Historical access | Time Travel (read-only) | Branch (read-write) |
+| Cleanup mechanism | VACUUM old files | GC pages beyond retention window |
+
+**Key difference**: Delta Lake operates at file granularity (tens of MB ~ 1GB), Lakebase at page granularity (8KB). Finer granularity means Copy-on-Write cost is extremely low, making writable branches nearly zero-overhead.
+
+### Comparison: Lakebase Branch vs Snowflake vs Delta Lake
+
+|  | Lakebase Branch | Snowflake Zero-Copy Clone | Delta Lake Time Travel |
+|--|----------------|--------------------------|----------------------|
+| **Nature** | Read-write full database branch | Metadata clone of table/schema/DB | Query historical versions (read-only) |
+| **Writable?** | ✅ Full insert/update/delete | ✅ Clone is independent and writable | ❌ Read-only |
+| **Any point in time?** | ✅ Any moment within retention window (0-30 days) | ❌ Can only clone current state | ✅ By version number or timestamp |
+| **Isolation** | ✅ Storage-level isolation | ✅ Independent after writes | N/A (read-only) |
+| **Storage overhead** | Only modified pages (8KB granularity) | Only modified micro-partitions | Retains old version files |
+| **Merge back to parent?** | ❌ Not currently supported | ❌ Not supported | N/A |
+
+### Practical Use Cases
+
+#### 1. Safe Schema Migration Testing
+
+```
+-- Create branch from current state
+CREATE BRANCH schema_test FROM main;
+
+-- Test schema changes on the branch
+ALTER TABLE orders ADD COLUMN discount DECIMAL(5,2);
+UPDATE orders SET discount = 0.1 WHERE category = 'VIP';
+
+-- Run tests, verify app compatibility...
+-- Pass → apply same migration to production
+-- Fail → DROP BRANCH schema_test; zero impact
+```
+
+#### 2. AI Agent Sandbox
+
+```
+-- Create branch as agent sandbox
+CREATE BRANCH agent_sandbox FROM main;
+
+-- Agent operates freely in the sandbox
+UPDATE products SET price = price * 0.8;  -- 20% off everything
+
+-- Human reviews → approve and apply to production, or discard branch
+```
+
+#### 3. Debugging from a Historical Point
+
+```
+-- "Data went wrong after 3 PM yesterday"
+CREATE BRANCH debug_branch FROM main AT '2026-03-25 15:00:00';
+
+-- Investigate on the branch, compare with current production data
+-- Find root cause, then fix production
+```
+
+### Summary
+
+```
+Delta Lake Time Travel    = Read-only snapshots (time machine to view the past)
+Snowflake Zero-Copy Clone = Writable copy of current state (clone the present)
+Lakebase Branch           = Writable fork from any point in time (parallel universe)
+```
+
+> **Time Travel = Take a time machine to view history**
+> **Lakebase Branch = Open a parallel universe at any point in history, experiment freely, without affecting the main timeline**
+
+---
+
 ## References
 
 - [A New Era of Databases: Lakebase | Databricks Blog](https://www.databricks.com/blog/what-is-a-lakebase)
@@ -501,3 +673,6 @@ Every change is appended as a new row, preserving full history. The Lakehouse ca
 - [Unity Catalog vs Snowflake Governance](https://www.celestinfo.com/unity-catalog-vs-snowflake-governance.html)
 - [Mirroring Azure Databricks Unity Catalog in Microsoft Fabric](https://blog.fabric.microsoft.com/en-us/blog/unified-by-design-mirroring-azure-databricks-unity-catalog-in-microsoft-fabric-now-generally-available)
 - [Databricks Introduces Lakebase for AI Workloads | InfoQ](https://www.infoq.com/news/2026/02/databricks-lakebase-postgresql/)
+- [Branches | Databricks Docs](https://docs.databricks.com/aws/en/oltp/projects/branches)
+- [Neon Architecture Overview](https://neon.com/docs/introduction/architecture-overview)
+- [Deep Dive into Neon Storage Engine](https://neon.com/blog/get-page-at-lsn)

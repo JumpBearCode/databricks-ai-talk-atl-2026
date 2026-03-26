@@ -17,6 +17,7 @@
 9. [讲座核心观点提炼：为什么需要 Lakebase](#9-讲座核心观点提炼为什么需要-lakebase)
 10. [Lakehouse 与 Lakebase 的双向同步](#10-lakehouse-与-lakebase-的双向同步)
 11. [CDC（Change Data Capture）变更数据捕获](#11-cdcchange-data-capture变更数据捕获)
+12. [Lakebase Branching：数据库的 Git](#12-lakebase-branching数据库的-git)
 
 ---
 
@@ -474,6 +475,173 @@ Delta 表：lb_orders_history (SCD Type 2)
 
 ---
 
+## 12. Lakebase Branching：数据库的 Git
+
+### 概念
+
+Lakebase 的 Branching 就像 **Git for Database**——你可以在任意时间点对整个数据库创建一个分支，拥有完整数据，但**不复制任何数据**。
+
+```
+Production DB (100GB)
+    │
+    │  CREATE BRANCH（瞬间完成，额外存储 ≈ 0）
+    │
+    ├── Branch: dev-testing
+    │     修改了 1GB 数据 → 只额外存储 1GB
+    │     其余 99GB 和 Production 共享同一份物理数据
+    │
+    └── Branch: schema-migration-test
+          修改了 500MB → 只额外存储 500MB
+```
+
+### 底层原理：Copy-on-Write（写时复制）
+
+Lakebase 的 Branching 技术来自 Databricks 收购的 **Neon**——一个重新架构了 PostgreSQL 存储引擎的项目。
+
+#### 传统 PostgreSQL vs Neon/Lakebase 架构
+
+```
+传统 PostgreSQL：
+  计算 + 存储绑定在一起
+  复制数据库 → 必须拷贝全部数据
+  100GB 数据库 → 复制 = 200GB
+
+Neon/Lakebase 架构：
+┌─────────────────────────┐
+│  Compute（计算层）       │  ← 标准 PostgreSQL 进程
+└──────────┬──────────────┘
+           │  "给我 page #42 在 LSN @100 时的版本"
+┌──────────▼──────────────┐
+│  Pageserver（页服务器）   │  ← 核心创新
+│  • 不覆写旧页，追加新版本  │
+│  • 通过 WAL 重建任意版本   │
+└──────────┬──────────────┘
+┌──────────▼──────────────┐
+│  Object Storage (S3)     │  ← 所有历史版本持久化存储
+└─────────────────────────┘
+```
+
+#### Branch 创建过程
+
+```
+Step 1: 用户说"在时间点 T 创建 branch"
+Step 2: Pageserver 只记录一条元数据：
+        "branch-dev 的起点 = 时间点 T 的 LSN"
+Step 3: 完成。没有任何数据拷贝。
+
+读操作：
+  → 请求 page #42
+  → branch 没改过 → 从 parent 拿 page #42 在时间点 T 的版本
+
+写操作（Copy-on-Write）：
+  → 修改 page #42
+  → 只为 branch 创建 page #42 的新版本
+  → 不影响 production
+```
+
+图示：
+
+```
+                    Page #1   Page #2   Page #3   Page #4
+                    ─────────────────────────────────────
+Production (T=100):   [A]       [B]       [C]       [D]
+
+Branch 修改了 Page #2:
+
+Production:           [A]       [B]       [C]       [D]
+                       ↑         ↑         ↑         ↑
+Branch:                │       [B']        │         │
+                       │    (只存这一页)    │         │
+                      共享      独立       共享      共享
+
+额外存储 = 只有 Page #2 的新版本
+```
+
+### 与 Delta Lake 的架构类比
+
+Lakebase Branching 和 Delta Lake 的版本管理**本质上是同一种思想**：
+
+```
+共同模式：
+  1. 数据写入后不覆写（Immutable）
+  2. 用日志/元数据记录"当前版本由哪些数据块组成"
+  3. 不同版本/分支 = 不同的指针组合，指向同一批底层数据块
+```
+
+| | Delta Lake | Lakebase (Neon) |
+|--|-----------|-----------------|
+| 不可变数据单元 | Parquet file（几十 MB ~ 1GB） | Page（8KB） |
+| 版本日志 | `_delta_log/` JSON 事务日志 | WAL (Write-Ahead Log) |
+| 版本标识 | 版本号 (v0, v1, v2...) | LSN (Log Sequence Number) |
+| 某个版本 = | 一组文件指针 | 一组页指针 |
+| 历史访问 | Time Travel（只读） | Branch（可读写） |
+| 清理机制 | VACUUM 清理旧文件 | GC 清理超出保留窗口的旧页 |
+
+**关键区别**：Delta Lake 的粒度是文件级（几十 MB ~ 1GB），Lakebase 是页级（8KB）。粒度更细，所以 Copy-on-Write 的成本极低，branch 上的可写操作几乎零开销。
+
+### 对比 Snowflake Time Travel 和 Delta Lake Time Travel
+
+|  | Lakebase Branch | Snowflake Zero-Copy Clone | Delta Lake Time Travel |
+|--|----------------|--------------------------|----------------------|
+| **本质** | 可读写的完整数据库分支 | 表/库的元数据克隆 | 查询历史版本（只读） |
+| **可以写入？** | ✅ 自由增删改 | ✅ clone 独立可写 | ❌ 只读 |
+| **任意时间点？** | ✅ 保留窗口内任意时间点（0-30天） | ❌ 只能 clone 当前状态 | ✅ 按版本号或时间戳 |
+| **隔离性** | ✅ 存储层隔离 | ✅ 写入后独立 | N/A（只读） |
+| **存储开销** | 只有被修改的页（8KB 粒度） | 只有被修改的 micro-partition | 保留旧版本文件 |
+| **合并回 parent？** | ❌ 目前不支持 | ❌ 不支持 | N/A |
+
+### 实际 Use Case
+
+#### 1. 安全的 Schema Migration 测试
+
+```
+# 从当前时间点创建 branch
+CREATE BRANCH schema_test FROM main;
+
+# 在 branch 上测试 schema 变更
+ALTER TABLE orders ADD COLUMN discount DECIMAL(5,2);
+UPDATE orders SET discount = 0.1 WHERE category = 'VIP';
+
+# 跑测试，验证应用兼容性...
+# 通过 → 在 production 执行同样的 migration
+# 失败 → DROP BRANCH schema_test; 零影响
+```
+
+#### 2. AI Agent 的沙盒环境
+
+```
+# 创建 branch 作为 Agent 沙盒
+CREATE BRANCH agent_sandbox FROM main;
+
+# Agent 在沙盒里自由操作
+UPDATE products SET price = price * 0.8;  -- 全场 8 折
+
+# 人工 review → 满意则在 production 执行，不满意则丢弃 branch
+```
+
+#### 3. 基于历史数据点的调试
+
+```
+# "昨天下午 3 点之后数据就不对了"
+CREATE BRANCH debug_branch FROM main AT '2026-03-25 15:00:00';
+
+# 在 branch 上排查，对比当前数据和历史数据
+# 找到根因后修复 production
+```
+
+### 本质总结
+
+```
+Delta Lake Time Travel  = 只读快照（坐时光机回去看历史）
+Snowflake Zero-Copy Clone = 当前状态的可写副本（克隆现在）
+Lakebase Branch         = 任意时间点的可写分叉（在任意历史时刻开辟平行宇宙）
+```
+
+> **Time Travel = 坐时光机回去看历史**
+> **Lakebase Branch = 在任意历史时间点开辟一个平行宇宙，随便折腾，不影响主时间线**
+
+---
+
 ## 参考资料
 
 - [A New Era of Databases: Lakebase | Databricks Blog](https://www.databricks.com/blog/what-is-a-lakebase)
@@ -487,3 +655,6 @@ Delta 表：lb_orders_history (SCD Type 2)
 - [Unity Catalog vs Snowflake Governance](https://www.celestinfo.com/unity-catalog-vs-snowflake-governance.html)
 - [Mirroring Azure Databricks Unity Catalog in Microsoft Fabric](https://blog.fabric.microsoft.com/en-us/blog/unified-by-design-mirroring-azure-databricks-unity-catalog-in-microsoft-fabric-now-generally-available)
 - [Databricks Introduces Lakebase for AI Workloads | InfoQ](https://www.infoq.com/news/2026/02/databricks-lakebase-postgresql/)
+- [Branches | Databricks Docs](https://docs.databricks.com/aws/en/oltp/projects/branches)
+- [Neon Architecture Overview](https://neon.com/docs/introduction/architecture-overview)
+- [Deep Dive into Neon Storage Engine](https://neon.com/blog/get-page-at-lsn)
